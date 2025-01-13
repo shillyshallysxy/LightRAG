@@ -137,6 +137,7 @@ async def _merge_nodes_then_upsert(
     entity_name: str,
     nodes_data: list[dict],
     knowledge_graph_inst: BaseGraphStorage,
+    # entity_vdb: BaseVectorStorage,
     global_config: dict,
 ):
     already_entity_types = []
@@ -246,6 +247,20 @@ async def _merge_edges_then_upsert(
 
     return edge_data
 
+async def extract_entity_types(content, global_config: dict) -> dict:
+    """
+    :param content:
+    :param global_config:
+    :return: {"entity_types": ["entity_type1", "entity_type2", ...], "domain": "domain_name"}
+    """
+    use_llm_func: callable = global_config["llm_model_func"]
+
+    entity_type_extract_prompt = PROMPTS["entity_type_extraction"]
+    content_entity_types = await use_llm_func(entity_type_extract_prompt.format(input_text=content))
+    content_entity_types = json.loads(content_entity_types)
+
+    return content_entity_types
+
 
 async def extract_entities(
     chunks: dict[str, TextChunkSchema],
@@ -305,6 +320,13 @@ async def extract_entities(
         chunk_key = chunk_key_dp[0]
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
+
+        try:
+            content_entity_types =  await extract_entity_types(content, global_config)
+            context_base["entity_types"] = ",".join(content_entity_types["entity_types"])
+        except Exception as e:
+            logger.error(f"[{chunk_key}] Failed to parse entity types=content_entity_types, error={e}")
+
         # hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
         hint_prompt = entity_extract_prompt.format(
             **context_base, input_text="{input_text}"
