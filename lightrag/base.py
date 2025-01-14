@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import TypedDict, Union, Literal, Generic, TypeVar, Optional, Dict, Any
+from typing import TypedDict, Union, Literal, Generic, TypeVar, Optional, Dict, Any, Iterator
 from enum import Enum
 
 import numpy as np
@@ -52,6 +52,9 @@ class BaseVectorStorage(StorageNameSpace):
     embedding_func: EmbeddingFunc
     meta_fields: set = field(default_factory=set)
 
+    async def delete(self, ids) -> None:
+        raise NotImplementedError
+
     async def query(self, query: str, top_k: int) -> list[dict]:
         raise NotImplementedError
 
@@ -102,6 +105,9 @@ class BaseGraphStorage(StorageNameSpace):
         raise NotImplementedError
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
+        raise NotImplementedError
+
+    async def get_nodes(self) -> Iterator:
         raise NotImplementedError
 
     async def get_node(self, node_id: str) -> Union[dict, None]:

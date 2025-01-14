@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+
 from tqdm.asyncio import tqdm as tqdm_async
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -16,7 +18,7 @@ from .operate import (
     # local_query,global_query,hybrid_query,
     kg_query,
     naive_query,
-    mix_kg_vector_query,
+    mix_kg_vector_query, _handle_entity_relation_summary,
 )
 
 from .utils import (
@@ -41,9 +43,10 @@ from .storage import (
     NanoVectorDBStorage,
     NetworkXStorage,
     JsonDocStatusStorage,
+    PklKvStorage
 )
 
-from .prompt import GRAPH_FIELD_SEP
+from .prompt import GRAPH_FIELD_SEP, PROMPTS
 
 # future KG integrations
 
@@ -172,6 +175,7 @@ class LightRAG:
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
 
     enable_llm_cache: bool = True
+    enable_embedding_func_cache: bool = True
 
     # extension
     addon_params: dict = field(default_factory=dict)
@@ -212,9 +216,44 @@ class LightRAG:
             embedding_func=None,
         )
 
+        self.embedding_func_cache = self._get_storage_class()["PklKvStorage"](
+            namespace="embedding_func_cache",
+            global_config=asdict(self),
+            embedding_func=None,
+        )
+
         self.embedding_func = limit_async_func_call(self.embedding_func_max_async)(
             self.embedding_func
         )
+        _embedding_func = self.embedding_func
+
+        if self.enable_embedding_func_cache:
+            async def get_embedding_cached(texts):
+                embed = [None] * len(texts)
+                missed = []
+                for i, text in enumerate(texts):
+                    key = compute_mdhash_id(text)
+                    value = await self.embedding_func_cache.get_by_id(key)
+                    if value is None:
+                        missed.append([i, text])
+                    else:
+                        embed[i] = value
+                if len(missed) == 0:
+                    return embed
+
+                missed_embedding = await _embedding_func([text for _, text in missed])
+                missed_cached = {}
+                for (i, _), embedding in zip(missed, missed_embedding):
+                    key = compute_mdhash_id(texts[i])
+                    missed_cached[key] = embedding
+                    embed[i] = embedding
+                await self.embedding_func_cache.upsert(missed_cached)
+                return embed
+
+            self.embedding_func = EmbeddingFunc(func=get_embedding_cached,
+                                                embedding_dim=self.embedding_func.embedding_dim,
+                                                max_token_size=self.embedding_func.max_token_size,
+                                                concurrent_limit=self.embedding_func.concurrent_limit)
 
         ####
         # add embedding func by walter
@@ -282,6 +321,7 @@ class LightRAG:
     def _get_storage_class(self) -> dict:
         return {
             # kv storage
+            "PklKvStorage": PklKvStorage,
             "JsonKVStorage": JsonKVStorage,
             "OracleKVStorage": OracleKVStorage,
             "MongoKVStorage": MongoKVStorage,
@@ -442,6 +482,168 @@ class LightRAG:
                     # Ensure all indexes are updated after each document
                     await self._insert_done()
 
+    def pre_load_embeddings(self):
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.apre_load_embeddings())
+
+    async def apre_load_embeddings(self):
+        # preload embeddings for all entities
+        batch_size = 512
+        batches = []
+        for entity_name, node_data in await self.chunk_entity_relation_graph.get_nodes():
+            query_key = entity_name+node_data.get("description")
+            batches.append(query_key)
+            if len(batches) == batch_size:
+                logger.info(f"Preloading embeddings for {len(batches)} entities")
+                await self.embedding_func(batches)
+                batches = []
+        if len(batches) > 0:
+            logger.info(f"Preloading embeddings for {len(batches)} entities")
+            await self.embedding_func(batches)
+
+    def merge(self):
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.amerge())
+
+    async def _atry_merge_one_node(self, entity_name, node_data):
+        def deduplicate(text):
+            return GRAPH_FIELD_SEP.join(list(set(text.split(GRAPH_FIELD_SEP))))
+
+        query_key = entity_name + node_data.get("description")
+        similar_entity = await self.entities_vdb.query(query_key, top_k=5)
+        if not similar_entity:
+            return
+
+        # top 1
+        for _similar_entity in similar_entity:
+            if _similar_entity.get("entity_name") != entity_name:
+                similar_entity = _similar_entity
+                break
+        if similar_entity.get("distance") <= 0.85:
+            return
+
+        logger.info(f"Try to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, "
+                    f"distance: {similar_entity['distance']}")
+
+        already_node = await self.chunk_entity_relation_graph.get_node(similar_entity['entity_name'])
+        if not already_node:
+            logger.error(f"Failed to get similar entity {similar_entity['entity_name']} from graph")
+            return
+
+        already_entity_types = already_node["entity_type"]
+        already_source_ids = already_node["source_id"]
+        already_description = already_node["description"]
+        # merge node data
+        merge_result_raw = await self.llm_model_func(PROMPTS["merge_entities"].format(
+            entity_1=json.dumps({"entity_name": entity_name, "entity_type": node_data["entity_type"],
+                                 "description": node_data["description"]}),
+            entity_2=json.dumps({"entity_name": similar_entity["entity_name"], "entity_type": already_entity_types,
+                                 "description": already_description}),
+        ))
+        try:
+            merge_result = json.loads(merge_result_raw)
+            if not merge_result["merged"]:
+                logger.debug(
+                    f"No need to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
+                return
+        except Exception as e:
+            logger.error(
+                f"Failed to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}, error: {str(e)}")
+            return
+
+        # merge node data
+        new_description = deduplicate(GRAPH_FIELD_SEP.join([node_data["description"], already_description]))
+        new_source_id = deduplicate(GRAPH_FIELD_SEP.join([node_data["source_id"], already_source_ids]))
+        new_description = await _handle_entity_relation_summary(
+            merge_result['entity_name'], new_description, asdict(self)
+        )
+        needs_to_remove = dict()
+        if merge_result['entity_name'] == entity_name:
+            needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
+        elif merge_result['entity_name'] == similar_entity['entity_name']:
+            needs_to_remove[entity_name] = node_data
+        else:
+            needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
+            needs_to_remove[entity_name] = node_data
+
+        node_data = dict(
+            entity_type=merge_result["entity_type"],
+            description=new_description,
+            source_id=new_source_id,
+        )
+
+        await self.chunk_entity_relation_graph.upsert_node(merge_result['entity_name'], node_data=node_data)
+
+        await self.entities_vdb.upsert({
+            compute_mdhash_id(merge_result['entity_name'], prefix="ent-"): {
+                "content": merge_result['entity_name'] + new_description,
+                "entity_name": merge_result['entity_name'],
+            }
+        })
+        for k, v in needs_to_remove.items():
+            logger.debug(f"Delete/Merge existing entity {k}")
+            exist_edges = await self.chunk_entity_relation_graph.get_node_edges(k)
+            for src_id, tgt_id in exist_edges:
+                exist_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
+
+                if src_id == k:
+                    src_id = merge_result['entity_name']
+                if tgt_id == k:
+                    tgt_id = merge_result['entity_name']
+
+                new_keywords = exist_edge['keywords']
+                new_description = exist_edge['description']
+                new_source_id = exist_edge['source_id']
+                new_weight = exist_edge['weight']
+                if await self.chunk_entity_relation_graph.has_edge(src_id, tgt_id):
+                    new_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
+                    new_keywords = deduplicate(GRAPH_FIELD_SEP.join([new_edge['keywords'], new_keywords]))
+                    new_description = deduplicate(GRAPH_FIELD_SEP.join([new_edge['description'], new_description]))
+                    new_source_id = deduplicate(GRAPH_FIELD_SEP.join([new_edge['source_id'], new_source_id]))
+                    new_weight = new_edge['weight'] + new_weight
+
+                new_description = await _handle_entity_relation_summary(
+                    f"({src_id}, {tgt_id})", new_description, asdict(self)
+                )
+
+                await self.chunk_entity_relation_graph.upsert_edge(
+                    src_id,
+                    tgt_id,
+                    edge_data=dict(
+                        weight=new_weight,
+                        description=new_description,
+                        keywords=new_keywords,
+                        source_id=new_source_id,
+                    ))
+
+            await self.entities_vdb.delete([compute_mdhash_id(k, prefix="ent-")])
+            await self.chunk_entity_relation_graph.delete_node(k)
+
+        logger.info(
+            f"Successfully merged entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
+        await self._insert_done()
+
+    async def amerge(self):
+        re_iter_graph = True
+        judged_node = set()
+        while re_iter_graph:
+            try:
+                for entity_name, node_data in await self.chunk_entity_relation_graph.get_nodes():
+                    if entity_name in judged_node:
+                        continue
+                    judged_node.add(entity_name)
+                    await self._atry_merge_one_node(entity_name, node_data)
+                re_iter_graph = False
+            except Exception as e:
+                if str(e) == 'dictionary changed size during iteration':
+                    re_iter_graph = True
+                else:
+                    logger.error(f"Failed to merge entities, error: {str(e)}")
+                    re_iter_graph = False
+
+        logger.info("Merge entities done")
+        await self._insert_done()
+
     async def _insert_done(self):
         tasks = []
         for storage_inst in [
@@ -451,6 +653,7 @@ class LightRAG:
             self.entities_vdb,
             self.relationships_vdb,
             self.chunks_vdb,
+            self.embedding_func_cache,
             self.chunk_entity_relation_graph,
         ]:
             if storage_inst is None:

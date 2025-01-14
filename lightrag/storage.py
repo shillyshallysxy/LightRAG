@@ -1,9 +1,12 @@
 import asyncio
 import html
 import os
+import pickle
+from functools import wraps
+
 from tqdm.asyncio import tqdm as tqdm_async
 from dataclasses import dataclass
-from typing import Any, Union, cast, Dict
+from typing import Any, Union, cast, Dict, Iterator
 import networkx as nx
 import numpy as np
 from nano_vectordb import NanoVectorDB
@@ -24,6 +27,81 @@ from .base import (
     DocProcessingStatus,
     DocStatusStorage,
 )
+
+@dataclass
+class PklKvStorage(BaseKVStorage):
+    def __post_init__(self):
+        working_dir = self.global_config["working_dir"]
+        self._file_name = os.path.join(working_dir, f"kv_store_{self.namespace}.pkl")
+        if os.path.exists(self._file_name):
+            with open(self._file_name, 'rb') as f:
+                self._data = pickle.load(f)
+        else:
+            self._data = {}
+        self._lock = asyncio.Lock()
+        logger.info(f"Load KV {self.namespace} with {len(self._data)} data")
+
+    async def all_keys(self) -> list[str]:
+        return list(self._data.keys())
+
+    async def index_done_callback(self):
+        with open(self._file_name, 'wb') as f:
+            pickle.dump(self._data, f)
+
+    async def get_by_id(self, id):
+        return self._data.get(id, None)
+
+    async def get_by_ids(self, ids, fields=None):
+        if fields is None:
+            return [self._data.get(id, None) for id in ids]
+        return [
+            (
+                {k: v for k, v in self._data[id].items() if k in fields}
+                if self._data.get(id, None)
+                else None
+            )
+            for id in ids
+        ]
+
+    async def filter_keys(self, data: list[str]) -> set[str]:
+        return set([s for s in data if s not in self._data])
+
+    async def upsert(self, data: dict[str, dict]):
+        left_data = {k: v for k, v in data.items() if k not in self._data}
+        self._data.update(left_data)
+        return left_data
+
+    async def drop(self):
+        self._data = {}
+
+    async def filter(self, filter_func):
+        """Filter key-value pairs based on a filter function
+
+        Args:
+            filter_func: The filter function, which takes a value as an argument and returns a boolean value
+
+        Returns:
+            Dict: Key-value pairs that meet the condition
+        """
+        result = {}
+        async with self._lock:
+            for key, value in self._data.items():
+                if filter_func(value):
+                    result[key] = value
+        return result
+
+    async def delete(self, ids: list[str]):
+        """Delete data with specified IDs
+
+        Args:
+            ids: List of IDs to delete
+        """
+        async with self._lock:
+            for id in ids:
+                if id in self._data:
+                    del self._data[id]
+            await self.index_done_callback()
+            logger.info(f"Successfully deleted {len(ids)} items from {self.namespace}")
 
 
 @dataclass
@@ -112,6 +190,9 @@ class NanoVectorDBStorage(BaseVectorStorage):
         self.cosine_better_than_threshold = self.global_config.get(
             "cosine_better_than_threshold", self.cosine_better_than_threshold
         )
+
+    async def delete(self, ids):
+        self._client.delete(ids)
 
     async def upsert(self, data: dict[str, dict]):
         logger.info(f"Inserting {len(data)} vectors to {self.namespace}")
@@ -321,6 +402,9 @@ class NetworkXStorage(BaseGraphStorage):
 
     async def get_node(self, node_id: str) -> Union[dict, None]:
         return self._graph.nodes.get(node_id)
+
+    async def get_nodes(self) -> Iterator:
+        return self._graph.nodes(data=True)
 
     async def node_degree(self, node_id: str) -> int:
         return self._graph.degree(node_id)

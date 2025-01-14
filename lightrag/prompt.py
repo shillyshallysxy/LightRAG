@@ -187,6 +187,20 @@ Output:
 """
 
 PROMPTS[
+    "merge_entities"
+] = """You are a helpful assistant responsible for helping merge entities.
+Given two entities and their respective descriptions and their entity type.
+Distinguish whether the two entities are the same or whether one contains the other. If so, merge them into a single entity.
+Otherwise, provide a brief explanation and mark the merged flag in the response as false.
+#######
+-Data-
+Entity1: {entity_1}
+Entity2: {entity_2}
+JSON response:
+{{"entity_type": "\"<entity_type>\"", "entity_name": "\"<entity_name>\"", "merged": <true/false>, "explanation": "<explanation>"}}
+"""
+
+PROMPTS[
     "entiti_continue_extraction"
 ] = """MANY entities were missed in the last extraction.  Add them below using the same format:
 """
