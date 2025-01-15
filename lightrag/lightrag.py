@@ -175,7 +175,7 @@ class LightRAG:
     vector_db_storage_cls_kwargs: dict = field(default_factory=dict)
 
     enable_llm_cache: bool = True
-    enable_embedding_func_cache: bool = True
+    enable_embedding_func_cache: bool = False
 
     # extension
     addon_params: dict = field(default_factory=dict)
@@ -343,15 +343,16 @@ class LightRAG:
             "JsonDocStatusStorage": JsonDocStatusStorage,
         }
 
-    def insert(self, string_or_strings):
+    def insert(self, string_or_strings, string_or_strings_title=""):
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert(string_or_strings))
+        return loop.run_until_complete(self.ainsert(string_or_strings, string_or_strings_title))
 
-    async def ainsert(self, string_or_strings):
+    async def ainsert(self, string_or_strings, string_or_strings_title=""):
         """Insert documents with checkpoint support
 
         Args:
             string_or_strings: Single document string or list of document strings
+            string_or_strings_title: Single document title string or list of document title strings
         """
         if isinstance(string_or_strings, str):
             string_or_strings = [string_or_strings]
@@ -431,6 +432,7 @@ class LightRAG:
                         # Extract and store entities and relationships
                         maybe_new_kg = await extract_entities(
                             chunks,
+                            chunk_title=string_or_strings_title,
                             knowledge_graph_inst=self.chunk_entity_relation_graph,
                             entity_vdb=self.entities_vdb,
                             relationships_vdb=self.relationships_vdb,
@@ -501,11 +503,11 @@ class LightRAG:
             logger.info(f"Preloading embeddings for {len(batches)} entities")
             await self.embedding_func(batches)
 
-    def merge(self):
+    def merge(self, similar_threshold=0.85):
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.amerge())
+        return loop.run_until_complete(self.amerge(similar_threshold))
 
-    async def _atry_merge_one_node(self, entity_name, node_data):
+    async def _atry_merge_one_node(self, entity_name, node_data, similar_threshold):
         def deduplicate(text):
             return GRAPH_FIELD_SEP.join(list(set(text.split(GRAPH_FIELD_SEP))))
 
@@ -519,7 +521,7 @@ class LightRAG:
             if _similar_entity.get("entity_name") != entity_name:
                 similar_entity = _similar_entity
                 break
-        if similar_entity.get("distance") <= 0.85:
+        if similar_entity.get("distance") <= similar_threshold:
             return
 
         logger.info(f"Try to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, "
@@ -623,7 +625,7 @@ class LightRAG:
             f"Successfully merged entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
         await self._insert_done()
 
-    async def amerge(self):
+    async def amerge(self, similar_threshold=0.85):
         re_iter_graph = True
         judged_node = set()
         while re_iter_graph:
@@ -632,7 +634,7 @@ class LightRAG:
                     if entity_name in judged_node:
                         continue
                     judged_node.add(entity_name)
-                    await self._atry_merge_one_node(entity_name, node_data)
+                    await self._atry_merge_one_node(entity_name, node_data, similar_threshold)
                 re_iter_graph = False
             except Exception as e:
                 if str(e) == 'dictionary changed size during iteration':
