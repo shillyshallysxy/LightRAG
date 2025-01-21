@@ -2,9 +2,7 @@ import asyncio
 import html
 import os
 import pickle
-from functools import wraps
 
-from networkx.classes.reportviews import DegreeView
 from tqdm.asyncio import tqdm as tqdm_async
 from dataclasses import dataclass
 from typing import Any, Union, cast, Dict, Iterator
