@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 
+from sqlalchemy.orm import relationship
 from tqdm.asyncio import tqdm as tqdm_async
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -185,11 +186,11 @@ class LightRAG:
     doc_status_storage: str = field(default="JsonDocStatusStorage")
 
     def __post_init__(self):
-        log_file = os.path.join("lightrag.log")
-        set_logger(log_file)
-        logger.setLevel(self.log_level)
-
         logger.info(f"Logger initialized for working directory: {self.working_dir}")
+
+        log_file = os.path.join("lightrag.log")
+        set_logger(os.path.join(self.working_dir, log_file))
+        logger.setLevel(self.log_level)
 
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self).items()])
         logger.debug(f"LightRAG init with param:\n  {_print_config}\n")
@@ -343,16 +344,16 @@ class LightRAG:
             "JsonDocStatusStorage": JsonDocStatusStorage,
         }
 
-    def insert(self, string_or_strings, string_or_strings_title=""):
+    def insert(self, string_or_strings, meta_data: dict= {}):
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert(string_or_strings, string_or_strings_title))
+        return loop.run_until_complete(self.ainsert(string_or_strings, meta_data))
 
-    async def ainsert(self, string_or_strings, string_or_strings_title=""):
+    async def ainsert(self, string_or_strings, meta_data: dict= {}):
         """Insert documents with checkpoint support
 
         Args:
             string_or_strings: Single document string or list of document strings
-            string_or_strings_title: Single document title string or list of document title strings
+            meta_data: Optional metadata to attach to the document
         """
         if isinstance(string_or_strings, str):
             string_or_strings = [string_or_strings]
@@ -363,6 +364,7 @@ class LightRAG:
         # 2. Generate document IDs and initial status
         new_docs = {
             compute_mdhash_id(content, prefix="doc-"): {
+                **(meta_data or {}),
                 "content": content,
                 "content_summary": self._get_content_summary(content),
                 "content_length": len(content),
@@ -432,7 +434,7 @@ class LightRAG:
                         # Extract and store entities and relationships
                         maybe_new_kg = await extract_entities(
                             chunks,
-                            chunk_title=string_or_strings_title,
+                            chunk_title=meta_data.get("title", ""),
                             knowledge_graph_inst=self.chunk_entity_relation_graph,
                             entity_vdb=self.entities_vdb,
                             relationships_vdb=self.relationships_vdb,
@@ -509,7 +511,8 @@ class LightRAG:
 
     async def _atry_merge_one_node(self, entity_name, node_data, similar_threshold):
         def deduplicate(text):
-            return GRAPH_FIELD_SEP.join(list(set(text.split(GRAPH_FIELD_SEP))))
+            texts = text.split(GRAPH_FIELD_SEP) if isinstance(text, str) else text
+            return GRAPH_FIELD_SEP.join(list(set(texts)))
 
         query_key = entity_name + node_data.get("description")
         similar_entity = await self.entities_vdb.query(query_key, top_k=5)
@@ -535,94 +538,129 @@ class LightRAG:
         already_entity_types = already_node["entity_type"]
         already_source_ids = already_node["source_id"]
         already_description = already_node["description"]
+
+        new_description = deduplicate(GRAPH_FIELD_SEP.join([node_data["description"], already_description]))
+        new_source_id = deduplicate(GRAPH_FIELD_SEP.join([node_data["source_id"], already_source_ids]))
         # merge node data
         merge_result_raw = await self.llm_model_func(PROMPTS["merge_entities"].format(
-            entity_1=json.dumps({"entity_name": entity_name, "entity_type": node_data["entity_type"],
+            entity_1=json.dumps({"entity_name": entity_name,
+                                 "entity_type": node_data["entity_type"],
                                  "description": node_data["description"]}),
-            entity_2=json.dumps({"entity_name": similar_entity["entity_name"], "entity_type": already_entity_types,
+            entity_2=json.dumps({"entity_name": similar_entity["entity_name"],
+                                 "entity_type": already_entity_types,
                                  "description": already_description}),
         ))
         try:
             merge_result = json.loads(merge_result_raw)
-            if not merge_result["merged"]:
+            if not merge_result.get("merged", False):
                 logger.debug(
                     f"No need to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
-                return
+            else:
+                # merge node data
+                new_description = await _handle_entity_relation_summary(
+                    merge_result['entity_name'], new_description, asdict(self)
+                )
+                needs_to_remove = dict()
+                if merge_result['entity_name'] == entity_name:
+                    needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
+                elif merge_result['entity_name'] == similar_entity['entity_name']:
+                    needs_to_remove[entity_name] = node_data
+                else:
+                    needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
+                    needs_to_remove[entity_name] = node_data
+
+                node_data = dict(
+                    entity_type=merge_result["entity_type"],
+                    description=new_description,
+                    source_id=new_source_id,
+                )
+
+                await self.chunk_entity_relation_graph.upsert_node(merge_result['entity_name'], node_data=node_data)
+
+                await self.entities_vdb.upsert({
+                    compute_mdhash_id(merge_result['entity_name'], prefix="ent-"): {
+                        "content": merge_result['entity_name'] + new_description,
+                        "entity_name": merge_result['entity_name'],
+                    }
+                })
+                for k, v in needs_to_remove.items():
+                    logger.debug(f"Delete/Merge existing entity {k}")
+                    exist_edges = await self.chunk_entity_relation_graph.get_node_edges(k)
+                    for src_id, tgt_id in exist_edges:
+                        o_src_id, o_tgt_id = src_id, tgt_id
+                        exist_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
+
+                        if src_id == k:
+                            src_id = merge_result['entity_name']
+                        if tgt_id == k:
+                            tgt_id = merge_result['entity_name']
+
+                        new_keywords = exist_edge['keywords']
+                        new_description = exist_edge['description']
+                        new_source_id = exist_edge['source_id']
+                        new_weight = exist_edge['weight']
+                        if await self.chunk_entity_relation_graph.has_edge(src_id, tgt_id):
+                            new_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
+                            new_keywords = deduplicate(GRAPH_FIELD_SEP.join([new_edge['keywords'], new_keywords]))
+                            new_description = deduplicate(
+                                GRAPH_FIELD_SEP.join([new_edge['description'], new_description]))
+                            new_source_id = deduplicate(GRAPH_FIELD_SEP.join([new_edge['source_id'], new_source_id]))
+                            new_weight = new_edge['weight'] + new_weight
+
+                        new_description = await _handle_entity_relation_summary(
+                            f"({src_id}, {tgt_id})", new_description, asdict(self)
+                        )
+
+                        await self.relationships_vdb.delete([compute_mdhash_id(o_src_id + o_tgt_id, prefix="rel-"),
+                                                             compute_mdhash_id(o_tgt_id + o_src_id, prefix="rel-")])
+                        await self.chunk_entity_relation_graph.upsert_edge(
+                            src_id,
+                            tgt_id,
+                            edge_data=dict(
+                                weight=new_weight,
+                                description=new_description,
+                                keywords=new_keywords,
+                                source_id=new_source_id,
+                            ))
+
+                    await self.entities_vdb.delete([compute_mdhash_id(k, prefix="ent-")])
+                    await self.chunk_entity_relation_graph.delete_node(k)
+
+                logger.info(
+                    f"Successfully merged entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
         except Exception as e:
             logger.error(
                 f"Failed to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}, error: {str(e)}")
             return
 
-        # merge node data
-        new_description = deduplicate(GRAPH_FIELD_SEP.join([node_data["description"], already_description]))
-        new_source_id = deduplicate(GRAPH_FIELD_SEP.join([node_data["source_id"], already_source_ids]))
-        new_description = await _handle_entity_relation_summary(
-            merge_result['entity_name'], new_description, asdict(self)
-        )
-        needs_to_remove = dict()
-        if merge_result['entity_name'] == entity_name:
-            needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
-        elif merge_result['entity_name'] == similar_entity['entity_name']:
-            needs_to_remove[entity_name] = node_data
-        else:
-            needs_to_remove[similar_entity['entity_name']] = similar_entity['entity_name']
-            needs_to_remove[entity_name] = node_data
+        if not merge_result.get("merged", False):
+            if not await self.chunk_entity_relation_graph.has_edge(entity_name, similar_entity['entity_name']):
+                relationship_result_raw = await self.llm_model_func(PROMPTS["build_entity_relationship"].format(
+                    entity_1=json.dumps({"entity_name": entity_name,
+                                         "entity_type": node_data["entity_type"],
+                                         "description": node_data["description"]}),
+                    entity_2=json.dumps({"entity_name": similar_entity["entity_name"],
+                                         "entity_type": already_entity_types,
+                                         "description": already_description}),
+                ))
+                try:
+                    relationship_result = json.loads(relationship_result_raw)
+                    if relationship_result.get("relationship_exists", False):
+                        logger.info(f'build relationship {entity_name} with similar entity {similar_entity["entity_name"]}, relationship result: {relationship_result_raw}')
+                        await self.chunk_entity_relation_graph.upsert_edge(
+                            entity_name,
+                            similar_entity['entity_name'],
+                            edge_data=dict(
+                                weight=relationship_result['strength'],
+                                description=relationship_result['description'],
+                                keywords=deduplicate(relationship_result['keywords']),
+                                source_id=new_source_id,
+                            ))
+                except Exception as e:
+                    logger.error(
+                        f"Failed to build relationship {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}, error: {str(e)}")
+                    return
 
-        node_data = dict(
-            entity_type=merge_result["entity_type"],
-            description=new_description,
-            source_id=new_source_id,
-        )
-
-        await self.chunk_entity_relation_graph.upsert_node(merge_result['entity_name'], node_data=node_data)
-
-        await self.entities_vdb.upsert({
-            compute_mdhash_id(merge_result['entity_name'], prefix="ent-"): {
-                "content": merge_result['entity_name'] + new_description,
-                "entity_name": merge_result['entity_name'],
-            }
-        })
-        for k, v in needs_to_remove.items():
-            logger.debug(f"Delete/Merge existing entity {k}")
-            exist_edges = await self.chunk_entity_relation_graph.get_node_edges(k)
-            for src_id, tgt_id in exist_edges:
-                exist_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
-
-                if src_id == k:
-                    src_id = merge_result['entity_name']
-                if tgt_id == k:
-                    tgt_id = merge_result['entity_name']
-
-                new_keywords = exist_edge['keywords']
-                new_description = exist_edge['description']
-                new_source_id = exist_edge['source_id']
-                new_weight = exist_edge['weight']
-                if await self.chunk_entity_relation_graph.has_edge(src_id, tgt_id):
-                    new_edge = await self.chunk_entity_relation_graph.get_edge(src_id, tgt_id)
-                    new_keywords = deduplicate(GRAPH_FIELD_SEP.join([new_edge['keywords'], new_keywords]))
-                    new_description = deduplicate(GRAPH_FIELD_SEP.join([new_edge['description'], new_description]))
-                    new_source_id = deduplicate(GRAPH_FIELD_SEP.join([new_edge['source_id'], new_source_id]))
-                    new_weight = new_edge['weight'] + new_weight
-
-                new_description = await _handle_entity_relation_summary(
-                    f"({src_id}, {tgt_id})", new_description, asdict(self)
-                )
-
-                await self.chunk_entity_relation_graph.upsert_edge(
-                    src_id,
-                    tgt_id,
-                    edge_data=dict(
-                        weight=new_weight,
-                        description=new_description,
-                        keywords=new_keywords,
-                        source_id=new_source_id,
-                    ))
-
-            await self.entities_vdb.delete([compute_mdhash_id(k, prefix="ent-")])
-            await self.chunk_entity_relation_graph.delete_node(k)
-
-        logger.info(
-            f"Successfully merged entity {entity_name} with similar entity {similar_entity['entity_name']}, merge result: {merge_result_raw}")
         await self._insert_done()
 
     async def amerge(self, similar_threshold=0.85):

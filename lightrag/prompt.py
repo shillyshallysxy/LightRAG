@@ -201,12 +201,45 @@ Description List: {description_list}
 Output:
 """
 
+
+# """You are a expert assistant responsible for entity merging.
+# Your task is to analyze the relationships, features, and differences between two entities based on the provided text.
+# Your goal is to determine whether these entities can be merged.
+#
+# Please identify the entity types and names from the text and decide if the entities can be merged
+# - entity type given in the data is not always accurate, please mainly focus on the entity name and description to identify if they can be merged.
+# - use your judgement to determine the correct entity type
+#
+# Provide a detailed explanation for your decision.
+#
+# Return your findings in JSON format as raw text (Do not include markdown syntax).
+#
+# #######
+# -Data-
+# Entity1: {entity_1}
+# Entity2: {entity_2}
+# JSON response:
+# {{"entity_type": "\"<entity_type>\"", "entity_name": "\"<entity_name>\"", "merged": <true/false>, "explanation": "<explanation>"}}
+# """
 PROMPTS[
     "merge_entities"
-] = """You are a helpful assistant responsible for helping merge entities.
-Given two entities and their respective descriptions and their entity type.
-Distinguish whether the two entities are the same or whether one contains the other. If so, merge them into a single entity.
-Otherwise, provide a brief explanation and mark the merged flag in the response as false.
+] = """As a Knowledge Graph's expert, please determine if the following two entity names refer to the same thing and should be merged.
+
+Please consider the following points:
+Whether they are different language expressions of the same thing
+Whether they are formal names and nicknames/aliases
+Whether they are abbreviations and full names
+Whether there are significant semantic differences
+
+Please distinguish whether the two entities should be merged. 
+If so, merge them into a single entity and mark merged in the response as true.
+And then, please provide the entity type and name for the merged entity and provide a brief explanation.
+Otherwise, mark the merged flag in the response as false.
+
+Notice:
+- entity type given in the data is not always accurate, please mainly focus on the entity name and description.
+
+Return your findings in JSON format as raw text (Do not include markdown syntax).
 #######
 -Data-
 Entity1: {entity_1}
@@ -214,6 +247,27 @@ Entity2: {entity_2}
 JSON response:
 {{"entity_type": "\"<entity_type>\"", "entity_name": "\"<entity_name>\"", "merged": <true/false>, "explanation": "<explanation>"}}
 """
+
+PROMPTS[
+    "build_entity_relationship"
+] = """You are a expert assistant responsible for building entity relationships.
+Your task is to analyze the relationships, features, and differences between two entities based on the provided text. 
+Your goal is to identify if there is a clear relationship between them, provide a detailed information of their relationship including the follows:
+- relationship_description: explanation as to why you think the source entity and the target entity are related to each other
+- relationship_strength: a numeric score indicating strength of the relationship between the source entity and target entity
+- relationship_keywords: one or more high-level key words that summarize the overarching nature of the relationship, focusing on concepts or themes rather than specific details
+
+Provide a brief explanation for your decision.
+Return your findings in JSON format as raw text (Do not include markdown syntax).
+#######
+-Data-
+Entity1: {entity_1}
+Entity2: {entity_2}
+JSON response:
+{{"relationship_exists": <true/false>, "description": "<relationship_description>, "strength":"<relationship_strength>", "keywords":"<relationship_keywords>", "explanation": "<explanation>""}}
+"""
+
+
 
 PROMPTS[
     "entiti_continue_extraction"
