@@ -509,26 +509,10 @@ class LightRAG:
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.amerge(similar_threshold))
 
-    async def _atry_merge_one_node(self, entity_name, node_data, similar_threshold):
+    async def _atry_merge_one_node(self, entity_name, node_data, similar_entity):
         def deduplicate(text):
             texts = text.split(GRAPH_FIELD_SEP) if isinstance(text, str) else text
             return GRAPH_FIELD_SEP.join(list(set(texts)))
-
-        query_key = entity_name + node_data.get("description")
-        similar_entity = await self.entities_vdb.query(query_key, top_k=5)
-        if not similar_entity:
-            return
-
-        # top 1
-        for _similar_entity in similar_entity:
-            if _similar_entity.get("entity_name") != entity_name:
-                similar_entity = _similar_entity
-                break
-        if similar_entity.get("distance") <= similar_threshold:
-            return
-
-        logger.info(f"Try to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, "
-                    f"distance: {similar_entity['distance']}")
 
         already_node = await self.chunk_entity_relation_graph.get_node(similar_entity['entity_name'])
         if not already_node:
@@ -666,13 +650,37 @@ class LightRAG:
     async def amerge(self, similar_threshold=0.85):
         re_iter_graph = True
         judged_node = set()
+        judged_pair = set()
         while re_iter_graph:
             try:
                 for entity_name, node_data in await self.chunk_entity_relation_graph.get_nodes():
                     if entity_name in judged_node:
                         continue
                     judged_node.add(entity_name)
-                    await self._atry_merge_one_node(entity_name, node_data, similar_threshold)
+
+                    query_key = entity_name + node_data.get("description")
+                    similar_entity = await self.entities_vdb.query(query_key, top_k=5)
+                    if not similar_entity:
+                        continue
+
+                    # top 1
+                    for _similar_entity in similar_entity:
+                        if _similar_entity.get("entity_name") != entity_name:
+                            similar_entity = _similar_entity
+                            break
+                    if similar_entity.get("distance") <= similar_threshold:
+                        continue
+
+                    sorted_pair = tuple(sorted((entity_name, similar_entity['entity_name'])))
+                    if sorted_pair in judged_pair:
+                        continue
+
+                    logger.info(
+                        f"Try to merge entity {entity_name} with similar entity {similar_entity['entity_name']}, "
+                        f"distance: {similar_entity['distance']}")
+
+                    await self._atry_merge_one_node(entity_name, node_data, similar_entity)
+                    judged_pair.add(sorted_pair)
                 re_iter_graph = False
             except Exception as e:
                 if str(e) == 'dictionary changed size during iteration':
