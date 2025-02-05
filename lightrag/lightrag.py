@@ -450,7 +450,7 @@ class LightRAG:
 
                         # Store original document and chunks
                         await self.full_docs.upsert(
-                            {doc_id: {"content": doc["content"]}}
+                            {doc_id: {**(meta_data or {}), "content": doc["content"], }}
                         )
                         await self.text_chunks.upsert(chunks)
 
@@ -845,7 +845,12 @@ class LightRAG:
             if update_storage:
                 await self._insert_done()
 
-    def query(self, query: str, param: QueryParam = QueryParam()):
+    def query(self, query: str, param: QueryParam = QueryParam()) -> dict:
+        """
+        :param query:
+        :param param:
+        :return: {"response": str, "nodes": List[Dict], "edges": List[Dict], "kg_context": str, "vector_context": str}
+        """
         loop = always_get_an_event_loop()
         return loop.run_until_complete(self.aquery(query, param))
 

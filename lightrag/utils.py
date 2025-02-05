@@ -498,7 +498,7 @@ async def handle_cache(hashing_kv, args_hash, prompt, mode="default"):
 @dataclass
 class CacheData:
     args_hash: str
-    content: str
+    content: dict[str, Any]
     prompt: str
     quantized: Optional[np.ndarray] = None
     min_val: Optional[float] = None

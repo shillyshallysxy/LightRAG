@@ -3,7 +3,7 @@ import json
 import re
 
 from tqdm.asyncio import tqdm as tqdm_async
-from typing import Union
+from typing import Union, Any
 from collections import Counter, defaultdict
 import warnings
 from .utils import (
@@ -503,7 +503,7 @@ async def kg_query(
     query_param: QueryParam,
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
-) -> str:
+) -> dict[str, Any]:
     # Handle cache
     use_model_func = global_config["llm_model_func"]
     args_hash = compute_args_hash(query_param.mode, query)
@@ -570,7 +570,7 @@ async def kg_query(
 
     # Build context
     keywords = [ll_keywords, hl_keywords]
-    context = await _build_query_context(
+    ll_nodes, hl_edges, context = await _build_query_context(
         keywords,
         knowledge_graph_inst,
         entities_vdb,
@@ -579,8 +579,11 @@ async def kg_query(
         query_param,
     )
 
+    final_response = {}
     if query_param.only_need_context:
-        return context
+        final_response["kg_context"] = context
+        return final_response
+
     if context is None:
         return PROMPTS["fail_response"]
     sys_prompt_temp = PROMPTS["rag_response"]
@@ -588,7 +591,16 @@ async def kg_query(
         context_data=context, response_type=query_param.response_type
     )
     if query_param.only_need_prompt:
-        return sys_prompt
+        final_response["prompt"] = sys_prompt
+        return final_response
+
+    if query_param.need_context_graph:
+        final_response["nodes"] = ll_nodes
+        final_response["edges"] = hl_edges
+
+    if query_param.need_context:
+        final_response["kg_context"] = context
+
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
@@ -605,12 +617,13 @@ async def kg_query(
             .strip()
         )
 
+    final_response["response"] = response
     # Save to cache
     await save_to_cache(
         hashing_kv,
         CacheData(
             args_hash=args_hash,
-            content=response,
+            content=final_response,
             prompt=query,
             quantized=quantized,
             min_val=min_val,
@@ -618,7 +631,7 @@ async def kg_query(
             mode=query_param.mode,
         ),
     )
-    return response
+    return final_response
 
 
 async def _build_query_context(
@@ -635,6 +648,7 @@ async def _build_query_context(
     ll_kewwords, hl_keywrds = query[0], query[1]
     if query_param.mode in ["local", "hybrid"]:
         if ll_kewwords == "":
+            ll_nodes = []
             ll_entities_context, ll_relations_context, ll_text_units_context = (
                 "",
                 "",
@@ -646,6 +660,7 @@ async def _build_query_context(
             query_param.mode = "global"
         else:
             (
+                ll_nodes,
                 ll_entities_context,
                 ll_relations_context,
                 ll_text_units_context,
@@ -658,6 +673,7 @@ async def _build_query_context(
             )
     if query_param.mode in ["global", "hybrid"]:
         if hl_keywrds == "":
+            hl_edges = []
             hl_entities_context, hl_relations_context, hl_text_units_context = (
                 "",
                 "",
@@ -669,6 +685,7 @@ async def _build_query_context(
             query_param.mode = "local"
         else:
             (
+                hl_edges,
                 hl_entities_context,
                 hl_relations_context,
                 hl_text_units_context,
@@ -704,7 +721,7 @@ async def _build_query_context(
             hl_relations_context,
             hl_text_units_context,
         )
-    return f"""
+    return ll_nodes, hl_edges, f"""
 -----Entities-----
 ```csv
 {entities_context}
@@ -730,7 +747,7 @@ async def _get_node_data(
     # get similar entities
     results = await entities_vdb.query(query, top_k=query_param.top_k)
     if not len(results):
-        return "", "", ""
+        return [], "", "", ""
     # get entity information
     node_datas = await asyncio.gather(
         *[knowledge_graph_inst.get_node(r["entity_name"]) for r in results]
@@ -808,7 +825,7 @@ async def _get_node_data(
     for i, t in enumerate(use_text_units):
         text_units_section_list.append([i, t["content"]])
     text_units_context = list_of_list_to_csv(text_units_section_list)
-    return entities_context, relations_context, text_units_context
+    return results, entities_context, relations_context, text_units_context
 
 
 async def _find_most_related_text_unit_from_entities(
@@ -935,7 +952,7 @@ async def _get_edge_data(
     results = await relationships_vdb.query(keywords, top_k=query_param.top_k)
 
     if not len(results):
-        return "", "", ""
+        return [], "", "", ""
 
     edge_datas = await asyncio.gather(
         *[knowledge_graph_inst.get_edge(r["src_id"], r["tgt_id"]) for r in results]
@@ -1024,7 +1041,7 @@ async def _get_edge_data(
     for i, t in enumerate(use_text_units):
         text_units_section_list.append([i, t["content"]])
     text_units_context = list_of_list_to_csv(text_units_section_list)
-    return entities_context, relations_context, text_units_context
+    return results, entities_context, relations_context, text_units_context
 
 
 async def _find_most_related_entities_from_relationships(
@@ -1179,8 +1196,10 @@ async def naive_query(
     logger.info(f"Truncate {len(chunks)} to {len(maybe_trun_chunks)} chunks")
     section = "\n--New Chunk--\n".join([c["content"] for c in maybe_trun_chunks])
 
+    final_response = {}
     if query_param.only_need_context:
-        return section
+        final_response["vector_context"] = section
+        return final_response
 
     sys_prompt_temp = PROMPTS["naive_rag_response"]
     sys_prompt = sys_prompt_temp.format(
@@ -1188,7 +1207,11 @@ async def naive_query(
     )
 
     if query_param.only_need_prompt:
-        return sys_prompt
+        final_response["prompt"] = sys_prompt
+        return final_response
+
+    if query_param.need_context:
+        final_response["vector_context"] = section
 
     response = await use_model_func(
         query,
@@ -1207,12 +1230,13 @@ async def naive_query(
             .strip()
         )
 
+    final_response["response"] = response
     # Save to cache
     await save_to_cache(
         hashing_kv,
         CacheData(
             args_hash=args_hash,
-            content=response,
+            content=final_response,
             prompt=query,
             quantized=quantized,
             min_val=min_val,
@@ -1221,7 +1245,7 @@ async def naive_query(
         ),
     )
 
-    return response
+    return final_response
 
 
 async def mix_kg_vector_query(
@@ -1234,7 +1258,7 @@ async def mix_kg_vector_query(
     query_param: QueryParam,
     global_config: dict,
     hashing_kv: BaseKVStorage = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Hybrid retrieval implementation combining knowledge graph and vector search.
 
@@ -1281,7 +1305,7 @@ async def mix_kg_vector_query(
                 logger.warning(
                     "No JSON-like structure found in keywords extraction result"
                 )
-                return None
+                return  None, None, None
 
             result = match.group(0)
             keywords_data = json.loads(result)
@@ -1290,7 +1314,7 @@ async def mix_kg_vector_query(
 
             if not hl_keywords and not ll_keywords:
                 logger.warning("Both high-level and low-level keywords are empty")
-                return None
+                return  None, None, None
 
             # Convert keyword lists to strings
             ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
@@ -1298,7 +1322,7 @@ async def mix_kg_vector_query(
 
             # Set query mode based on available keywords
             if not ll_keywords_str and not hl_keywords_str:
-                return None
+                return  None, None, None
             elif not ll_keywords_str:
                 query_param.mode = "global"
             elif not hl_keywords_str:
@@ -1307,7 +1331,7 @@ async def mix_kg_vector_query(
                 query_param.mode = "hybrid"
 
             # Build knowledge graph context
-            context = await _build_query_context(
+            ll_nodes, hl_edges, context = await _build_query_context(
                 [ll_keywords_str, hl_keywords_str],
                 knowledge_graph_inst,
                 entities_vdb,
@@ -1316,11 +1340,11 @@ async def mix_kg_vector_query(
                 query_param,
             )
 
-            return context
+            return ll_nodes, hl_edges, context
 
         except Exception as e:
             logger.error(f"Error in get_kg_context: {str(e)}")
-            return None
+            return None, None, None
 
     async def get_vector_context():
         # Reuse vector search logic from naive_query
@@ -1370,7 +1394,7 @@ async def mix_kg_vector_query(
             return None
 
     # 3. Execute both retrievals in parallel
-    kg_context, vector_context = await asyncio.gather(
+    [ll_nodes, hl_edges, kg_context], vector_context = await asyncio.gather(
         get_kg_context(), get_vector_context()
     )
 
@@ -1378,8 +1402,12 @@ async def mix_kg_vector_query(
     if kg_context is None and vector_context is None:
         return PROMPTS["fail_response"]
 
+    final_response = {}
+
     if query_param.only_need_context:
-        return {"kg_context": kg_context, "vector_context": vector_context}
+        final_response["kg_context"] = kg_context
+        final_response["vector_context"] = vector_context
+        return final_response
 
     # 5. Construct hybrid prompt
     sys_prompt = PROMPTS["mix_rag_response"].format(
@@ -1393,7 +1421,16 @@ async def mix_kg_vector_query(
     )
 
     if query_param.only_need_prompt:
-        return sys_prompt
+        final_response["prompt"] = sys_prompt
+        return final_response
+
+    if query_param.need_context_graph:
+        final_response["nodes"] = ll_nodes
+        final_response["edges"] = hl_edges
+
+    if query_param.need_context:
+        final_response["kg_context"] = kg_context
+        final_response["vector_context"] = vector_context
 
     # 6. Generate response
     response = await use_model_func(
@@ -1413,12 +1450,13 @@ async def mix_kg_vector_query(
             .strip()
         )
 
+    final_response["response"] = response
     # 7. Save cache
     await save_to_cache(
         hashing_kv,
         CacheData(
             args_hash=args_hash,
-            content=response,
+            content=final_response,
             prompt=query,
             quantized=quantized,
             min_val=min_val,
@@ -1427,4 +1465,4 @@ async def mix_kg_vector_query(
         ),
     )
 
-    return response
+    return final_response
